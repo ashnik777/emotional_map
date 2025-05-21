@@ -1,128 +1,129 @@
 import os
-import io
-import re
-import torch
+import tempfile
 import warnings
 import argparse
-import tempfile
 from time import perf_counter
-import torchaudio
-from pydub import AudioSegment
+import base64
+
 import matplotlib.pyplot as plt
-import speech_recognition as sr
-from transformers import AutoModelForAudioClassification, Wav2Vec2FeatureExtractor
+import matplotlib as mpl
+import sounddevice as sd
+import soundfile as sf
+import google.generativeai as genai
 
-# Suppress warnings
-warnings.filterwarnings("ignore")
+# Gemini API setup
+GEMINI_API_KEY = "AIzaSyAhobKANOGwmHcV4kNGSAi0PbgUnuCGe0c"
+genai.configure(api_key=GEMINI_API_KEY)
 
-# Argument parser
-parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("--stop_word", default="exit", help="Stop word to abort transcription", type=str)
-parser.add_argument("--verbose", default=False, help="Print verbose output", type=bool)
-parser.add_argument("--energy", default=500, help="Energy level for mic to detect", type=int)
-parser.add_argument("--dynamic_energy", default=False, help="Enable dynamic energy", type=bool)
-parser.add_argument("--pause", default=0.5, help="Minimum silence duration (sec) to end phrase", type=float)
-parser.add_argument("--prediction_interval", default=3.0, help="Interval in seconds for emotion prediction", type=float)
-parser.add_argument("--plot_interval", default=0.5, help="Interval in seconds for plotting updates", type=float)
-args = parser.parse_args()
+# Configurations
+SAMPLERATE = 16000
+CHANNELS = 1
+EMOTIONS = ["Happy", "Sad", "Angry", "Neutral"]
 
-# Temp file setup
-temp_dir = tempfile.mkdtemp()
-save_path = os.path.join(temp_dir, "temp.wav")
+# Style settings
+mpl.rcParams.update({
+    "axes.titlesize": 20,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "axes.facecolor": "#f0f4f8",
+    "axes.edgecolor": "#555",
+    "grid.color": "#ccc",
+    "grid.linestyle": "--",
+    "font.family": "DejaVu Sans"
+})
 
-# Load model and extractor
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "r-f/wav2vec-english-speech-emotion-recognition"
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-model = AutoModelForAudioClassification.from_pretrained(model_name).to(device)
+emotion_mapping = {"Angry": -1, "Sad": -0.5, "Neutral": 0, "Happy": 1}
+emotion_colors = {"Angry": "#e74c3c", "Sad": "#3498db", "Neutral": "#95a5a6", "Happy": "#27ae60"}
 
-# Emotion simplification
-def simplify_emotion(raw_emotion):
-    if raw_emotion in ["happy", "surprise"]:
-        return "happy"
-    elif raw_emotion in ["angry", "disgust", "fear", "sad"]:
-        return "angry"
-    else:
-        return "neutral"
+# Convert audio file to base64
+def audio_to_base64(audio_path: str) -> str:
+    with open(audio_path, "rb") as audio_file:
+        return base64.b64encode(audio_file.read()).decode("utf-8")
 
-# Mapping for plotting
-simplified_emotion_mapping = {
-    "angry": -1,
-    "neutral": 0,
-    "happy": 1
-}
+# Gemini API request for emotion detection
+def detect_emotion(audio_path: str) -> str:
+    try:
+        audio_b64 = audio_to_base64(audio_path)
+        prompt = (
+            "Analyze the speaker's emotion from vocal tone and intonation in this WAV audio."
+            " Respond strictly with one word: Happy, Sad, Angry, or Neutral."
+        )
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([{"role": "user", "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}}
+        ]}])
+        emotion = response.text.strip().capitalize()
+        return emotion if emotion in EMOTIONS else "Neutral"
+    except Exception as e:
+        print(f"[Gemini API Error]: {e}")
+        return "Neutral"
 
-# Stop word checker
-def check_stop_word(predicted_text: str) -> bool:
-    pattern = re.compile('[\W_]+', re.UNICODE)
-    return pattern.sub('', predicted_text).lower() == args.stop_word
+# Initialize figure and axis globally to update continuously
+fig, ax = plt.subplots(figsize=(15, 7))
+fig.patch.set_facecolor('#f9f9f9')
 
-# Emotion prediction
-def predict_emotion(audio_path):
-    waveform, sample_rate = torchaudio.load(audio_path)
-    if sample_rate != 16000:
-        waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
+# Enhanced plotting function
+def plot_emotions(timestamps, emotions):
+    ax.clear()
 
-    inputs = feature_extractor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    ax.set_title('Real-time Emotion Recognition', fontsize=24, pad=25)
+    ax.set_xlabel('Time (seconds)', fontsize=16)
+    ax.set_ylabel('Emotion Intensity', fontsize=16)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.set_yticks([-1, -0.5, 0, 1])
+    ax.set_yticklabels(['Angry 😡', 'Sad 😢', 'Neutral 😐', 'Happy 😄'])
+    ax.set_ylim(-1.2, 1.2)
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        predicted_label = torch.argmax(outputs.logits, dim=-1)
-        raw_emotion = model.config.id2label[predicted_label.item()]
-    return simplify_emotion(raw_emotion)
+    ax.plot(timestamps, [emotion_mapping[emo] for emo in emotions], linestyle='-', linewidth=2, alpha=0.7, color='#2c3e50')
 
-# Transcription and plotting
-def transcribe():
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = args.energy
-    recognizer.pause_threshold = args.pause
-    recognizer.dynamic_energy_threshold = args.dynamic_energy
+    for t, emo in zip(timestamps, emotions):
+        score = emotion_mapping[emo]
+        ax.scatter(t, score, s=120, color=emotion_colors[emo], edgecolor='black', linewidth=1.5, zorder=3)
+        ax.annotate(
+            emo, xy=(t, score), xytext=(t, score + 0.15), fontsize=14,
+            ha='center', va='bottom',
+            bbox=dict(boxstyle="round,pad=0.3", fc=emotion_colors[emo], ec="#222", lw=0.5)
+        )
 
-    fig, ax = plt.subplots()
+    plt.tight_layout()
+    plt.pause(0.1)
 
-    timestamps = []
-    emotion_scores = []
-    current_emotion = "neutral"
-    last_prediction_time = perf_counter()
+# Continuous emotion detection loop
+def start_emotion_detection(duration: int):
+    temp_dir = tempfile.mkdtemp()
+    audio_path = os.path.join(temp_dir, "temp_audio.wav")
 
-    with sr.Microphone(sample_rate=16000) as source:
-        print(f"Listening... (say '{args.stop_word}' to stop)")
+    timestamps, detected_emotions = [], []
+    start_time = perf_counter()
+
+    print("\n🎙️ Speak now (Press Ctrl+C to exit).")
+    try:
         while True:
-            # Record small chunk of audio
-            audio = recognizer.record(source, duration=args.plot_interval)
-            now = perf_counter()
+            audio = sd.rec(int(duration * SAMPLERATE), samplerate=SAMPLERATE, channels=CHANNELS)
+            sd.wait()
+            sf.write(audio_path, audio, SAMPLERATE)
 
-            # Save chunk to file
-            data = io.BytesIO(audio.get_wav_data())
-            audio_clip = AudioSegment.from_file(data)
-            audio_clip.export(save_path, format="wav")
+            emotion = detect_emotion(audio_path)
+            elapsed = round(perf_counter() - start_time, 2)
 
-            # Predict emotion every N seconds
-            if now - last_prediction_time >= args.prediction_interval:
-                current_emotion = predict_emotion(save_path)
-                last_prediction_time = now
-                print("Detected Emotion (simplified):", current_emotion)
+            timestamps.append(elapsed)
+            detected_emotions.append(emotion)
 
-                if check_stop_word(current_emotion):
-                    break
+            print(f"⏰ {elapsed}s: Detected Emotion: {emotion}")
+            plot_emotions(timestamps, detected_emotions)
 
-            # Store timestamp and emotion score
-            timestamps.append(now - timestamps[0] if timestamps else 0)
-            emotion_scores.append(simplified_emotion_mapping[current_emotion])
-
-            # Plotting
-            ax.clear()
-            ax.plot(timestamps, emotion_scores, color='blue', marker='o')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Emotion')
-            ax.set_title(f'Real-time Emotion (updated every {args.plot_interval}s)')
-            ax.set_ylim(-1.1, 1.1)
-            ax.set_yticks([-1, 0, 1])
-            ax.set_yticklabels(['Angry', 'Neutral', 'Happy'])
-            plt.pause(0.05)
-
-    plt.close()
+    except KeyboardInterrupt:
+        print("\n⏹️ Emotion detection terminated.")
+        plt.ioff()
+        plt.show()
 
 if __name__ == "__main__":
-    transcribe()
+    warnings.filterwarnings("ignore")
+
+    parser = argparse.ArgumentParser(description="Real-time Emotion Detection via Gemini API")
+    parser.add_argument("--duration", default=5, type=int, help="Recording chunk duration in seconds")
+    args = parser.parse_args()
+
+    start_emotion_detection(args.duration)
